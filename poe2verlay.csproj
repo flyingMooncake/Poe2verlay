@@ -12,7 +12,7 @@
     <RootNamespace>Poe2Verlay</RootNamespace>
     <ApplicationIcon>assets/poe2verlay.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <Product>poe2verlay</Product>
 

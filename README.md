@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" width="220" alt="poe2verlay logo"></p>
+
 # poe2verlay
 
 Price overlay for Path of Exile 2 on Windows. Press a key on the Expedition choice screen (the meteor / Verisium Remnant) and every option gets its price in **divine** and **chaos** next to it. Prices come from [poe.ninja](https://poe.ninja/poe2/economy).
@@ -81,7 +83,7 @@ You need the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0). The
 ```bat
 winget install Microsoft.DotNet.SDK.8      :: once
 winget install JRSoftware.InnoSetup        :: once, optional: also builds the installer
-compile.bat                                :: -> dist\poe2verlay.exe (+ dist\poe2verlay-setup-1.0.0.exe)
+compile.bat                                :: -> dist\poe2verlay.exe (+ dist\poe2verlay-setup-1.0.1.exe)
 compile.bat 1.0.1                          :: same, with another version number
 ```
 
