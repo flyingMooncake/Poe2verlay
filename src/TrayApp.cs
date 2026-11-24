@@ -28,12 +28,13 @@ internal sealed class TrayApp : ApplicationContext
     readonly OcrScanner? _ocr;
     readonly string _ocrError;
     List<string> _leagues = new();
-    Keys _scanKey, _itemKey, _autoKey, _runStartKey, _runEndKey, _windowKey, _stashKey, _sessionKey, _shotKey;
+    Keys _scanKey, _itemKey, _autoKey, _runStartKey, _runEndKey, _windowKey, _stashKey, _sessionKey, _shotKey, _browserKey;
 
     bool _scanning, _loading, _inventoryScanning, _cancelInventory, _verifying, _shooting;
     RectangleF _scanBounds;
     Rectangle _scanArea;
     int _scanCount;
+    List<(RectangleF Bounds, string Word)> _scanUnpriced = new();
     OverlayKind _kind;
     DateTime _hideAt = DateTime.MaxValue;
     IntPtr _shownForeground;
@@ -43,6 +44,18 @@ internal sealed class TrayApp : ApplicationContext
     InventoryForm? _inventoryForm;
     StashForm? _stashForm;
     readonly List<StashTabRecord> _stashTabs = StashStore.Load();
+
+    // Trade site: price checks of what poe.ninja doesn't price, and the trade browser overlay.
+    TradeChecker? _trade;
+    TradeBrowserForm? _browser;
+    string? _lastTradeUrl;
+    bool _lastTradeOpened;
+    int _tradeCheck;
+    /// <summary>The user closed the price label (click, Esc, mouse moved away): a trade result coming later stays hidden.</summary>
+    bool _itemDismissed;
+    Task<BuildProfile?>? _build;
+    string _buildLink = "";
+    DateTime _buildLoaded;
 
     // Expedition rumours: the uncharted-waters tooltip under a resting cursor.
     bool _rumourBusy, _rumourDetails;
@@ -127,6 +140,7 @@ internal sealed class TrayApp : ApplicationContext
 
         var loading = LoadPricesAsync(force: false);
         _ = RumourBook.RefreshAsync(_s.RumourSheet);
+        _ = BuildAsync(); // the trade price checks' build priorities, ready before the first check
         if (_firstRun) OpenSettings();
         await loading;
     }
@@ -208,6 +222,7 @@ internal sealed class TrayApp : ApplicationContext
         _stashKey = Hotkey.Parse(_s.StashHotkey);
         _sessionKey = Hotkey.Parse(_s.SessionHotkey);
         _shotKey = Hotkey.Parse(_s.ScreenshotHotkey);
+        _browserKey = Hotkey.Parse(_s.TradeBrowserHotkey);
     }
 
     /// <summary>Hotkey compare where the numpad digits count as the normal digits (Ctrl+0 either way).</summary>
@@ -225,15 +240,23 @@ internal sealed class TrayApp : ApplicationContext
         if ((key & Keys.KeyCode) == Keys.Escape)
         {
             if (_inventoryScanning) _cancelInventory = true;
+            _itemDismissed = true;
             if (_overlay.Visible) _overlay.BeginInvoke(HideOverlay);
             return false;
         }
 
         var foreground = Native.GetForegroundWindow();
+        // The trade browser has the keyboard: only its own hotkey (to hide it) is ours.
+        if (_browser is { IsHandleCreated: true } && foreground == _browser.Handle)
+        {
+            if (!Is(key, _browserKey)) return false;
+            _overlay.BeginInvoke(ToggleBrowser);
+            return true;
+        }
         if (_settingsForm != null && foreground == _settingsForm.Handle) return false;
         if (_s.HotkeysOnlyInGame && !GameWindow.IsPoe(foreground)) return false;
 
-        var ours = new[] { _scanKey, _itemKey, _autoKey, _runStartKey, _runEndKey, _windowKey, _stashKey, _sessionKey, _shotKey }.Any(h => Is(key, h));
+        var ours = new[] { _scanKey, _itemKey, _autoKey, _runStartKey, _runEndKey, _windowKey, _stashKey, _sessionKey, _shotKey, _browserKey }.Any(h => Is(key, h));
         if (_inventoryScanning) return ours; // swallow, but don't start anything mid-scan
 
         if (Is(key, _runStartKey))
@@ -264,6 +287,11 @@ internal sealed class TrayApp : ApplicationContext
         if (Is(key, _shotKey))
         {
             Run(ScreenshotAsync);
+            return true;
+        }
+        if (Is(key, _browserKey))
+        {
+            _overlay.BeginInvoke(ToggleBrowser);
             return true;
         }
 
@@ -389,10 +417,11 @@ internal sealed class TrayApp : ApplicationContext
 
             var sw = Stopwatch.StartNew();
             var segments = await _ocr.RecognizeAsync(capture, scale, region.Location);
-            var detections = ItemMatcher.PanelRows(_matcher.Find(segments));
+            var detections = ItemMatcher.PanelRows(_matcher.Find(segments), segments);
+            var unpriced = ItemMatcher.UnpricedRows(segments, detections);
             sw.Stop();
 
-            var bars = LabelBuilder.BarsForDetections(detections, _db, _s);
+            var bars = LabelBuilder.BarsForDetections(detections, _db, _s, unpriced);
             if (manual && _s.SaveDebug)
             {
                 var info = string.Create(CultureInfo.InvariantCulture,
@@ -403,7 +432,7 @@ internal sealed class TrayApp : ApplicationContext
             // Auto-scan must not replace a manual result or an item/message label that is still showing.
             if (!manual && _overlay.Visible && _kind is OverlayKind.Scan or OverlayKind.Item or OverlayKind.Message or OverlayKind.Rumours or OverlayKind.Report) return;
 
-            if (detections.Count == 0)
+            if (detections.Count == 0 && unpriced.Count == 0)
             {
                 if (manual) ShowMessage("No priced items found", $"{segments.Count} text lines read in {sw.ElapsedMilliseconds} ms · {_db.League} · prices {Fmt.Age(_db.UpdatedUtc)}", area);
                 else if (_kind == OverlayKind.Auto) HideOverlay();
@@ -413,9 +442,10 @@ internal sealed class TrayApp : ApplicationContext
             // Manual results stay up until the panel closes (VerifyScanAsync), Esc, or the scan key again.
             ShowOverlay(area, Array.Empty<OverlayLabel>(), manual ? OverlayKind.Scan : OverlayKind.Auto, manual ? 300 : 0,
                 segments.Select(sg => sg.Bounds).ToList(), bars);
-            _scanBounds = detections.Select(d => d.Bounds).Aggregate(RectangleF.Union);
+            _scanBounds = detections.Select(d => d.Bounds).Concat(unpriced.Select(r => r.Bounds)).Aggregate(RectangleF.Union);
             _scanArea = area;
             _scanCount = detections.Count;
+            _scanUnpriced = unpriced.Select(r => (r.Bounds, LongestWord(r.Text))).ToList();
         }
         catch (Exception ex)
         {
@@ -427,6 +457,9 @@ internal sealed class TrayApp : ApplicationContext
             _scanning = false;
         }
     }
+
+    static string LongestWord(string text) =>
+        text.Split(' ', StringSplitOptions.RemoveEmptyEntries).MaxBy(w => w.Count(char.IsLetter)) ?? text;
 
     /// <summary>
     /// Re-read just the rows we priced; once most of them are gone the panel was closed (Esc, X, reward picked),
@@ -445,7 +478,12 @@ internal sealed class TrayApp : ApplicationContext
             using var capture = GameWindow.Capture(region);
             var segments = await _ocr.RecognizeAsync(capture, 2.0, region.Location);
             if (_kind != OverlayKind.Scan || _matcher == null) return;
-            if (_matcher.Find(segments).Count * 2 < _scanCount) HideOverlay();
+            // Unpriced rows (skill rewards) can't be matched again: one counts as still there while a line at its
+            // place still has its longest word.
+            var unpricedLeft = _scanUnpriced.Count(row => segments.Any(sg =>
+                RectangleF.Inflate(row.Bounds, 6, 6).Contains(sg.Bounds.X + sg.Bounds.Width / 2, sg.Bounds.Y + sg.Bounds.Height / 2) &&
+                sg.Text.Contains(row.Word, StringComparison.OrdinalIgnoreCase)));
+            if ((_matcher.Find(segments).Count + unpricedLeft) * 2 < _scanCount + _scanUnpriced.Count) HideOverlay();
         }
         catch (Exception ex)
         {
@@ -466,14 +504,9 @@ internal sealed class TrayApp : ApplicationContext
 
     async Task ItemCheckAsync()
     {
-        if (_db == null || _matcher == null)
-        {
-            ShowMessage("Prices not loaded yet", _loading ? "downloading from poe.ninja…" : "check the league / internet connection");
-            return;
-        }
-
         var cursor = Cursor.Position;
-        var text = await ItemText.CopyHoveredItemAsync();
+        // Ctrl+Alt+C adds the mod tiers, but the Alt also flashes the ground item labels: off unless asked for.
+        var text = await ItemText.CopyHoveredItemAsync(advanced: _s.ItemAdvancedCopy);
         var item = text == null ? null : ItemText.Parse(text);
         if (item == null)
         {
@@ -481,18 +514,132 @@ internal sealed class TrayApp : ApplicationContext
             return;
         }
 
-        var entries = ItemText.Lookup(_matcher, item);
-        if (entries == null || entries.Count == 0)
+        var entries = _matcher == null ? null : ItemText.Lookup(_matcher, item);
+        var entry = entries is { Count: > 0 } ? ItemMatcher.PickPrimary(entries) : null;
+        var area = Screen.FromPoint(cursor).Bounds;
+        var seconds = _s.OverlaySeconds > 0 ? _s.OverlaySeconds : 15;
+
+        // Magic / rare gear: graded by its valuable mods first. Garbage and low grades get no search.
+        var tradeItem = TradeItem.Parse(text!);
+        ItemGrade? grade = null;
+        if (tradeItem != null && ItemGrader.Applies(tradeItem))
         {
-            ShowMessageAt(cursor, item.Name, $"no poe.ninja price ({item.Rarity})");
+            grade = ItemGrader.Grade(tradeItem);
+            if (grade.Garbage || !_s.TradePriceCheck || !ItemGrade.AtLeast(grade.Grade, _s.TradeSearchFromGrade))
+            {
+                ShowOverlay(area, new[] { LabelBuilder.ForGrade(cursor, item.Name, grade, tradeItem.Category, _s) }, OverlayKind.Item, seconds);
+                _itemCursor = cursor;
+                return;
+            }
+        }
+
+        // Currency, fragments, runes...: poe.ninja's exchange prices are real trades. Uniques (poe.ninja only sees
+        // listings) and everything poe.ninja doesn't price get a search on the trade site too.
+        var search = _s.TradePriceCheck && tradeItem != null && (grade != null || entry == null || entries!.Any(e => e.IsUnique));
+        if (!search)
+        {
+            if (entry == null || _db == null)
+            {
+                ShowMessageAt(cursor, item.Name, _db == null ? (_loading ? "downloading prices from poe.ninja\u2026" : "prices not loaded yet") : $"no poe.ninja price ({item.Rarity})");
+                return;
+            }
+            ShowOverlay(area, new[] { LabelBuilder.ForItem(cursor, item.Name, entry, entries!, item.Stack, _db, _s) }, OverlayKind.Item, seconds);
+            _itemCursor = cursor;
             return;
         }
 
-        var entry = ItemMatcher.PickPrimary(entries);
-        var label = LabelBuilder.ForItem(cursor, item.Name, entry, entries, item.Stack, _db, _s);
-        var area = Screen.FromPoint(cursor).Bounds;
-        ShowOverlay(area, new[] { label }, OverlayKind.Item, _s.OverlaySeconds > 0 ? _s.OverlaySeconds : 15);
+        var check = ++_tradeCheck;
+        _itemDismissed = false;
+        ShowOverlay(area, new[] { LabelBuilder.ForTrade(cursor, item.Name, entry, _db, _s, null, null, grade) }, OverlayKind.Item, 0);
         _itemCursor = cursor;
+
+        TradeResult? result = null;
+        string? error = null;
+        try
+        {
+            result = await Trade().PriceCheckAsync(tradeItem!, CurrentLeague, await BuildAsync(), _s, DivineOf, grade);
+            _lastTradeUrl = result.Url;
+            _lastTradeOpened = false;
+        }
+        catch (TradeException ex)
+        {
+            error = ex.Message.Contains("browser check", StringComparison.Ordinal) && !string.IsNullOrEmpty(_s.TradeBrowserHotkey)
+                ? $"pathofexile.com wants a browser check: press {_s.TradeBrowserHotkey}, pass it, close it and try again"
+                : ex.Message;
+        }
+        catch (Exception ex)
+        {
+            error = "trade search failed (see log)";
+            Log.Write("trade price check: " + ex);
+        }
+
+        // Another check started, or the label was closed (mouse moved away, click, Esc) while searching.
+        // Another check started, the user closed the label, or the game isn't in front any more. A label hidden only
+        // because the focus flickered while searching comes back with the result.
+        if (check != _tradeCheck || _itemDismissed || GameWindow.ForegroundPoe() == IntPtr.Zero) return;
+        ShowOverlay(area, new[] { LabelBuilder.ForTrade(cursor, item.Name, entry, _db, _s, result, error, grade) }, OverlayKind.Item, seconds);
+    }
+
+    double? DivineOf(string currency) => _matcher?.Lookup(currency)?.FirstOrDefault(e => !e.IsUnique)?.Divine;
+
+    TradeChecker Trade() => _trade ??= new TradeChecker();
+
+    /// <summary>The build from the poe.ninja link in the settings (reloaded every 30 minutes), or null.</summary>
+    Task<BuildProfile?> BuildAsync()
+    {
+        var link = _s.BuildProfileUrl.Trim();
+        if (link.Length == 0 || !BuildProfile.IsLink(link)) return Task.FromResult<BuildProfile?>(null);
+        if (_build == null || link != _buildLink || (DateTime.UtcNow - _buildLoaded).TotalMinutes > 30)
+        {
+            _buildLink = link;
+            _buildLoaded = DateTime.UtcNow;
+            _build = LoadBuildAsync(link);
+        }
+        return _build;
+    }
+
+    static async Task<BuildProfile?> LoadBuildAsync(string link)
+    {
+        try
+        {
+            var build = await BuildProfile.LoadAsync(link);
+            Log.Write($"build {build.Character}: {build.Summary}, {build.GearStats.Count} gear stats");
+            return build;
+        }
+        catch (Exception ex)
+        {
+            Log.Write("build profile: " + ex.Message);
+            return null;
+        }
+    }
+
+    // ---------------------------------------------------------------- trade browser
+
+    TradeBrowserForm Browser()
+    {
+        if (_browser != null) return _browser;
+        _browser = new TradeBrowserForm(_s) { Home = () => TradeWeb.SearchUrl(CurrentLeague) };
+        _browser.BoundsSaved += b =>
+        {
+            _s.TradeBrowserBounds = $"{b.X},{b.Y},{b.Width},{b.Height}";
+            _s.Save();
+        };
+        return _browser;
+    }
+
+    /// <summary>Show (on the last price check's search, if not opened yet) or hide the trade browser.</summary>
+    void ToggleBrowser()
+    {
+        var browser = Browser();
+        if (browser.Visible && Native.GetForegroundWindow() == browser.Handle)
+        {
+            browser.HideToGame();
+            return;
+        }
+        HideOverlay();
+        var url = _lastTradeUrl != null && !_lastTradeOpened ? _lastTradeUrl : null;
+        _lastTradeOpened = true;
+        _ = browser.ShowBrowserAsync(url);
     }
 
     // ---------------------------------------------------------------- runs
@@ -920,7 +1067,11 @@ internal sealed class TrayApp : ApplicationContext
         _overlay.ShowLabels(area, labels, obstacles, bars, panel);
         // Clicking a reward means it was picked: the bars go away. Messages just time out.
         if (kind is OverlayKind.Scan or OverlayKind.Auto or OverlayKind.Item or OverlayKind.Rumours or OverlayKind.Report)
-            _clickWatcher ??= new ClickWatcher(() => _overlay.BeginInvoke(HideOverlay));
+            _clickWatcher ??= new ClickWatcher(() => _overlay.BeginInvoke(() =>
+            {
+                _itemDismissed = true;
+                HideOverlay();
+            }));
         else
             StopClickWatcher();
         _kind = kind;
@@ -969,7 +1120,11 @@ internal sealed class TrayApp : ApplicationContext
             var c = Cursor.Position;
             var dx = c.X - _itemCursor.X;
             var dy = c.Y - _itemCursor.Y;
-            if (dx * dx + dy * dy > 220 * 220) HideOverlay();
+            if (dx * dx + dy * dy > 220 * 220)
+            {
+                _itemDismissed = true;
+                HideOverlay();
+            }
         }
     }
 
@@ -1080,7 +1235,7 @@ internal sealed class TrayApp : ApplicationContext
             expedition.DropDownItems.Add(new ToolStripMenuItem($"{r.Rating}   {r.ShortText} \u2192 {r.Map} ({r.KindText}): {r.Mods}") { Enabled = false });
         expedition.DropDownItems.Add(new ToolStripSeparator());
         if (_s.RumourSheet.StartsWith("http", StringComparison.OrdinalIgnoreCase))
-            expedition.DropDownItems.Add("Open the rating sheet", null, (_, _) => Process.Start(new ProcessStartInfo(_s.RumourSheet) { UseShellExecute = true }));
+            expedition.DropDownItems.Add("Open the ratings page", null, (_, _) => Process.Start(new ProcessStartInfo(_s.RumourSheet) { UseShellExecute = true }));
         expedition.DropDownItems.Add("Reload ratings now", null, async (_, _) =>
         {
             await RumourBook.RefreshAsync(_s.RumourSheet, force: true);
@@ -1093,6 +1248,7 @@ internal sealed class TrayApp : ApplicationContext
             Directory.CreateDirectory(ScreenshotDir);
             Process.Start(new ProcessStartInfo("explorer.exe", $"\"{ScreenshotDir}\"") { UseShellExecute = true });
         });
+        menu.Items.Add($"Trade browser   ({_s.TradeBrowserHotkey})", null, (_, _) => ToggleBrowser());
         menu.Items.Add("Refresh prices now", null, async (_, _) => await LoadPricesAsync(force: true));
         menu.Items.Add("Settings…", null, (_, _) => OpenSettings());
         menu.Items.Add("Open data folder (logs, debug)", null, (_, _) =>
@@ -1130,6 +1286,8 @@ internal sealed class TrayApp : ApplicationContext
         ApplyAutoScan();
         if (!_s.ExpeditionRumours && _kind == OverlayKind.Rumours) HideOverlay();
         if (old.RumourSheet != _s.RumourSheet) _ = RumourBook.RefreshAsync(_s.RumourSheet, force: true);
+        if (old.BuildProfileUrl != _s.BuildProfileUrl) _build = null;
+        if (_browser != null) _ = _browser.ApplySettingsAsync(_s);
         if (old.League != _s.League || old.IncludeUniques != _s.IncludeUniques)
         {
             _db = null;
@@ -1160,6 +1318,8 @@ internal sealed class TrayApp : ApplicationContext
         StopClickWatcher();
         _inventoryForm?.Dispose();
         _stashForm?.Dispose();
+        _browser?.Dispose();
+        _trade?.Dispose();
         _watchdog.Stop();
         _autoTimer.Stop();
         _refreshTimer.Stop();

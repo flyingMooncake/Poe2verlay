@@ -64,8 +64,31 @@ public sealed class AppSettings
 
     /// <summary>Rate the island rumours of uncharted waters (Expedition logbooks) while hovering them in a hideout.</summary>
     public bool ExpeditionRumours { get; set; } = true;
-    /// <summary>Rumour ratings: a Google Sheets link or a local .csv (Rumor, Map, Mods, Rating). Empty = built-in.</summary>
+    /// <summary>Rumour ratings: the poe.gnejs.app page, a Google Sheets link or a local .csv (Rumor, Map, Mods, Rating). Empty = built-in.</summary>
     public string RumourSheet { get; set; } = RumourBook.DefaultSheet;
+
+    /// <summary>Shows / hides the trade browser overlay (pathofexile.com/trade2 in a WebView2).</summary>
+    public string TradeBrowserHotkey { get; set; } = "Ctrl+T";
+    /// <summary>Last position of the trade browser ("x,y,w,h", empty = default).</summary>
+    public string TradeBrowserBounds { get; set; } = "";
+    /// <summary>The price check also searches the trade site for what poe.ninja doesn't price (rares, gems, bases...).</summary>
+    public bool TradePriceCheck { get; set; } = true;
+    /// <summary>Sellers to search: "available" (instant buyout + in person), "securable", "online", "any".</summary>
+    public string TradeStatus { get; set; } = "available";
+    /// <summary>The price check copies with Ctrl+Alt+C (mod tiers). Off: the Alt flashes the ground item labels.</summary>
+    public bool ItemAdvancedCopy { get; set; }
+    /// <summary>Magic / rare items: the grade (S, A, B, C) from which the price check searches the trade site.</summary>
+    public string TradeSearchFromGrade { get; set; } = "C";
+    /// <summary>Price check verdict: SELL when the cheapest listings like it go for at least this many chaos, else VENDOR.</summary>
+    public double SellAboveChaos { get; set; } = 5;
+    /// <summary>Rare items: how many of their most important stats become search filters.</summary>
+    public int TradeMaxStats { get; set; } = 4;
+    /// <summary>Rare items: a filter asks for at least this share of the rolled value.</summary>
+    public int TradeMinPercent { get; set; } = 85;
+    /// <summary>poe.ninja character link: the build whose priorities pick the stats a price check searches for.</summary>
+    public string BuildProfileUrl { get; set; } = "";
+    /// <summary>Load the Better Trading extension (Chrome Web Store) into the trade browser.</summary>
+    public bool TradeBetterTrading { get; set; } = true;
 
     public bool ShowExalted { get; set; }
     public bool IncludeUniques { get; set; } = true;
@@ -74,7 +97,7 @@ public sealed class AppSettings
 
     /// <summary>Bumped when defaults saved by an older version must be replaced.</summary>
     public int Version { get; set; }
-    const int CurrentVersion = 2;
+    const int CurrentVersion = 3;
 
     public static string Dir => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "poe2verlay");
@@ -99,6 +122,8 @@ public sealed class AppSettings
                     s.StashTop = fresh.StashTop;
                     s.StashSize = fresh.StashSize;
                 }
+                // The rumour ratings moved from Jestra1220's Google Sheet (stale) to poe.gnejs.app.
+                if (s.Version < 3 && s.RumourSheet == RumourBook.OldSheet) s.RumourSheet = RumourBook.DefaultSheet;
                 s.Version = CurrentVersion;
                 return s;
             }

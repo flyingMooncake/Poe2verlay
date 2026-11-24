@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace Poe2Verlay;
@@ -44,18 +45,21 @@ public sealed class Rumour
 }
 
 /// <summary>
-/// What each rumour means and how good it is. Ratings follow Jestra1220's sheet (the one linked from Palsteron's
-/// expedition guide), re-downloaded every few hours; notes are from poe.gnejs.app and the guides it credits.
+/// What each rumour means and how good it is. Ratings are Jestra1220's (the ones linked from Palsteron's expedition
+/// guide), read from poe.gnejs.app every few hours; notes are checked against the 0.5.5 patch notes and guides.
 /// </summary>
 internal static class RumourBook
 {
-    public const string DefaultSheet = "https://docs.google.com/spreadsheets/d/16YU8mSS7TdLPdmOunVjiPn_NrKVGfcnMkuMQDy8jgZA";
+    /// <summary>poe.gnejs.app's rumour table: Jestra1220's ratings, kept up to date there.</summary>
+    public const string DefaultSheet = "https://poe.gnejs.app/poe2/expedition/rumours";
+    /// <summary>Jestra1220's Google Sheet, the default until Oct 2026. Stale since (Aldur's Saga S+, no Crazed Chieftain).</summary>
+    public const string OldSheet = "https://docs.google.com/spreadsheets/d/16YU8mSS7TdLPdmOunVjiPn_NrKVGfcnMkuMQDy8jgZA";
 
     static readonly HttpClient Http = CreateHttp();
     static string? _appliedUrl;
     static bool _refreshing;
 
-    static string _sourceName = "built-in (Jestra1220's sheet, Oct 2026)";
+    static string _sourceName = "built-in (Jestra1220's ratings, Oct 2026)";
     static DateTime? _sourceTimeUtc;
 
     public static List<Rumour> All { get; private set; } = BuiltIn();
@@ -86,7 +90,8 @@ internal static class RumourBook
                 "No tablet tricks here any more (0.5.5d): one run per rumour",
             } },
         new() { Text = "Cold as ice...", Kind = RumourKind.Grand, Map = "Frigid Bluffs", Rating = "A+",
-            Mods = "old Expedition layout, infinite revives" },
+            Mods = "old (pre-0.5) Expedition: the classic logbook encounters",
+            Note = "no infinite revives any more: deaths are limited like on a waystone; some remnant mods make monsters immune to crits or a damage type" },
         new() { Text = "Nothin' to drink...", Aliases = new[] { "Nothing to drink" }, Kind = RumourKind.Grand, Map = "Stagnant Basin", Rating = "A",
             Mods = "Oil: oil derricks, big explosions" },
         new() { Text = "Endless cliffs...", Kind = RumourKind.Grand, Map = "Craggy Peninsula", Rating = "A",
@@ -100,18 +105,19 @@ internal static class RumourBook
                   "free areas (and free rumours to fish through) rather than in loot.",
             Source = "Jestra1220's sheet, poe.gnejs.app, gamerblurb" },
         new() { Text = "Somethin' fishy...", Aliases = new[] { "Something fishy" }, Kind = RumourKind.Grand, Map = "Bleached Shoals", Rating = "B",
-            Mods = "gold, all-res amulet remnants" },
+            Mods = "gold; clam chests drop amulets" },
         new() { Text = "Warm but risky...", Aliases = new[] { "It's warm", "It's warm but risky" }, Kind = RumourKind.Grand, Map = "Lush Island", Rating = "B", MapAliases = new[] { "Lush Isle" },
-            Mods = "experience, Beyond monsters, hoards" },
+            Mods = "experience, Beyond monsters, hoards",
+            Note = "the best experience of the Grand Expeditions: the pick when you need levels" },
         new() { Text = "Bleak and awful...", Kind = RumourKind.Grand, Map = "Barren Atoll", Rating = "B",
             Mods = "Strongboxes (gold chest remnants)",
-            Note = "had an immortal / invisible enemies bug, said to be fixed in 0.5.4b" },
+            Note = "don't open the strongboxes: 0.5.5 guides still report invisible, invincible monsters that brick the expedition (the 0.5.4b fix didn't hold)" },
         new() { Text = "It's dry at least...", Kind = RumourKind.Grand, Map = "Sloughed Gully", Rating = "D",
             Mods = "more monster effectiveness",
-            Note = "bad layout: remnant monsters can spawn on cliffs out of reach and brick the map; fewer explosives since 0.5.4" },
+            Note = "bad layout: remnant monsters spawn on cliffs out of reach (0.5.5 guides: expect to miss about 30% of the remnants); fewer explosives since 0.5.4" },
         new() { Text = "Wild roaming free...", Aliases = new[] { "Wild, roaming free" }, Kind = RumourKind.Grand, Map = "Grazed Prairie", Rating = "D",
             Mods = "Azmeri spirits",
-            Note = "fewer explosives since 0.5.4 hurt this one, avoid for now" },
+            Note = "fewer explosives since 0.5.4 hurt it (Jestra1220: avoid); only on juiced maps: lead the spirits into remnants to multiply drops; flying monsters can end up out of reach" },
 
         // Unique maps
         new() { Text = "Reflective waters...", Kind = RumourKind.UniqueMap, Map = "Lake of Kalandra", Rating = "A", MapAliases = new[] { "The Fractured Lake" },
@@ -318,7 +324,7 @@ internal static class RumourBook
             }
             if (File.Exists(sheet))
             {
-                if (force || _appliedUrl != sheet) Apply(await File.ReadAllTextAsync(sheet), Path.GetFileName(sheet), File.GetLastWriteTimeUtc(sheet));
+                if (force || _appliedUrl != sheet) Apply(await File.ReadAllTextAsync(sheet), Path.GetFileName(sheet), File.GetLastWriteTimeUtc(sheet), byIsland: false);
                 _appliedUrl = sheet;
                 return;
             }
@@ -328,18 +334,20 @@ internal static class RumourBook
                 return;
             }
 
-            var name = sheet == DefaultSheet ? "Jestra1220's sheet" : "your sheet";
+            var gnejs = url.Contains("gnejs.app", StringComparison.OrdinalIgnoreCase);
+            var name = sheet == DefaultSheet ? "Jestra1220 on poe.gnejs.app" : sheet == OldSheet ? "Jestra1220's old sheet" : "your sheet";
             var cache = CachePath(url);
             var age = File.Exists(cache) ? DateTime.UtcNow - File.GetLastWriteTimeUtc(cache) : TimeSpan.MaxValue;
             if (_appliedUrl != url && File.Exists(cache))
             {
-                Apply(await File.ReadAllTextAsync(cache), name, File.GetLastWriteTimeUtc(cache));
+                Apply(await File.ReadAllTextAsync(cache), name, File.GetLastWriteTimeUtc(cache), byIsland: gnejs);
                 _appliedUrl = url;
             }
             if (!force && age < TimeSpan.FromHours(6)) return;
 
-            var csv = await Http.GetStringAsync(url);
-            if (Apply(csv, name, DateTime.UtcNow))
+            var text = await Http.GetStringAsync(url);
+            var csv = gnejs ? GnejsCsv(text) : text;
+            if (Apply(csv, name, DateTime.UtcNow, byIsland: gnejs))
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(cache)!);
                 await File.WriteAllTextAsync(cache, csv);
@@ -356,9 +364,9 @@ internal static class RumourBook
         }
     }
 
-    static bool Apply(string csv, string name, DateTime timeUtc)
+    static bool Apply(string csv, string name, DateTime timeUtc, bool byIsland)
     {
-        var merged = Merge(BuiltIn(), csv, out var matched, out var added);
+        var merged = Merge(BuiltIn(), csv, out var matched, out var added, byIsland);
         if (matched < 5)
         {
             Log.Write($"rumour sheet ({name}): only {matched} known rumours, ignored");
@@ -374,8 +382,11 @@ internal static class RumourBook
     /// <summary>
     /// Sheet layout (Jestra1220's): "Rumor, Map Type, Mods, Rating"; a row with only the first cell starts a
     /// section ("Unique Maps", "Bosses", "Sagas"); rows before the first section are Grand Expeditions.
+    /// <paramref name="byIsland"/>: rows belong to the rumour of their island, not of their rumour text. A rating is
+    /// about what is on the island, and poe.gnejs.app pairs "Warm but risky" with Grazed Prairie and "Wild roaming
+    /// free" with Lush Island, the other way round from the sheet.
     /// </summary>
-    internal static List<Rumour> Merge(List<Rumour> builtIn, string csv, out int matched, out int added)
+    internal static List<Rumour> Merge(List<Rumour> builtIn, string csv, out int matched, out int added, bool byIsland = false)
     {
         matched = added = 0;
         var list = builtIn.Select(r => r.Copy()).ToList();
@@ -398,12 +409,19 @@ internal static class RumourBook
             }
             if (kind == null || cells[3] == "") continue;
 
-            var r = Match(list, cells[0], 0.25).Rumour;
+            var r = byIsland ? ByIsland(list, cells[1]) : Match(list, cells[0], 0.25).Rumour;
             if (r == null)
             {
                 r = new Rumour { Text = cells[0], Map = cells[1], Mods = cells[2] };
                 list.Add(r);
                 added++;
+            }
+            else if (byIsland)
+            {
+                matched++;
+                if (r.Mods == "") r.Mods = cells[2];
+                r.Rating = Regex.Replace(cells[3], @"\s*\(.*?\)\s*$", "");
+                continue;
             }
             else
             {
@@ -417,6 +435,41 @@ internal static class RumourBook
             r.Rating = cells[3];
         }
         return list;
+    }
+
+    /// <summary>The rumour whose island this is, also for "Grazed Praire" and "Jade Isles (non-exp Boss)".</summary>
+    static Rumour? ByIsland(IEnumerable<Rumour> list, string map)
+    {
+        var n = Plain(Regex.Replace(map, @"\(.*?\)", ""));
+        return list.FirstOrDefault(r => r.MapAliases.Prepend(r.Map).Any(name =>
+        {
+            var a = Plain(name);
+            return n == a || n.Length >= 8 && ItemMatcher.Levenshtein(n, a, 2) >= 0;
+        }));
+    }
+
+    /// <summary>poe.gnejs.app draws its table from JSON embedded in the page (Next.js): its rows as sheet CSV.</summary>
+    internal static string GnejsCsv(string html)
+    {
+        var payload = new StringBuilder();
+        foreach (Match m in Regex.Matches(html, @"self\.__next_f\.push\(\[1,""((?:[^""\\]|\\.)*)""\]\)"))
+            payload.Append(JsonSerializer.Deserialize<string>("\"" + m.Groups[1].Value + "\""));
+        static string Quote(string v) => "\"" + v.Replace("\"", "\"\"") + "\"";
+        var csv = new StringBuilder("Rumor,Map Type,Mods,Rating\n");
+        foreach (Match m in Regex.Matches(payload.ToString(), @"\{""Name"":""[^{}]*?\}"))
+        {
+            try
+            {
+                using var row = JsonDocument.Parse(m.Value);
+                string Get(string p) => row.RootElement.TryGetProperty(p, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString()! : "";
+                csv.Append(string.Join(",", new[] { Get("Name"), Get("Map"), Get("Mod"), Get("Rating") }.Select(Quote))).Append('\n');
+            }
+            catch (JsonException)
+            {
+                // not one of the table's rows
+            }
+        }
+        return csv.ToString();
     }
 
     static IEnumerable<List<string>> Csv(string text)

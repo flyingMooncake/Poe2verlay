@@ -126,12 +126,13 @@ public sealed class ParsedItem
 internal static partial class ItemText
 {
     /// <summary>Hover an item in game and copy its text with Ctrl+C (what every PoE price checker does).</summary>
-    public static async Task<string?> CopyHoveredItemAsync()
+    /// <param name="advanced">Ctrl+Alt+C: the mod tiers and ranges too ("{ Prefix Modifier "X" (Tier: 1) }").</param>
+    public static async Task<string?> CopyHoveredItemAsync(bool advanced = false)
     {
         string? previous = null;
         try { if (Clipboard.ContainsText()) previous = Clipboard.GetText(); } catch { /* clipboard busy */ }
 
-        var text = await CopyAsync(500);
+        var text = await CopyAsync(500, advanced);
 
         if (previous != null)
         {
@@ -141,13 +142,16 @@ internal static partial class ItemText
     }
 
     /// <summary>Send Ctrl+C and wait for the game to put item text on the clipboard. Null if nothing came.</summary>
-    public static async Task<string?> CopyAsync(int timeoutMs)
+    public static async Task<string?> CopyAsync(int timeoutMs, bool advanced = false)
     {
         var sequence = Native.GetClipboardSequenceNumber();
-        var inputs = new[]
-        {
-            Native.Key(0x11, false), Native.Key(0x43, false), Native.Key(0x43, true), Native.Key(0x11, true),
-        };
+        var inputs = advanced
+            ? new[]
+            {
+                Native.Key(0x11, false), Native.Key(0x12, false), Native.Key(0x43, false),
+                Native.Key(0x43, true), Native.Key(0x12, true), Native.Key(0x11, true),
+            }
+            : new[] { Native.Key(0x11, false), Native.Key(0x43, false), Native.Key(0x43, true), Native.Key(0x11, true) };
         Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Native.INPUT>());
 
         var waited = 0;

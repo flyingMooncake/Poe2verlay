@@ -35,6 +35,10 @@ internal static class SelfTest
         if (mode == "--stash-names") return StashNames(log, rest.Skip(1).ToArray());
         if (mode == "--rumours") return await RumourTest(outDir, log, rest.Count > 1 ? rest[1] : null);
         if (mode == "--rumour-ocr") return await RumourOcrTest(outDir, log, rest.Skip(1).ToList());
+        if (mode == "--trade-probe") return OnUiThread(() => TradeProbe(outDir, log));
+        if (mode == "--trade-check") return OnUiThread(() => TradeCheck(log, rest.Skip(1).ToList()));
+        if (mode == "--trade-extension") return OnUiThread(() => TradeExtension(log));
+        if (mode == "--grade") return GradeItems(log, rest.Skip(1).ToList());
 
         try
         {
@@ -97,8 +101,10 @@ internal static class SelfTest
                 sw.Restart();
                 var segments = await ocr.RecognizeAsync(bmp, scale, region.Location);
                 var ocrMs = sw.ElapsedMilliseconds;
-                var detections = ItemMatcher.PanelRows(matcher.Find(segments));
-                var bars = LabelBuilder.BarsForDetections(detections, db, settings);
+                var detections = ItemMatcher.PanelRows(matcher.Find(segments), segments);
+                var unpriced = ItemMatcher.UnpricedRows(segments, detections);
+                var bars = LabelBuilder.BarsForDetections(detections, db, settings, unpriced);
+                foreach (var row in unpriced) log.WriteLine($"  unpriced row: \"{row.Text}\"");
                 var info = string.Create(CultureInfo.InvariantCulture,
                     $"{mode} scale={scale:0.##} ocr={ocrMs}ms total={sw.ElapsedMilliseconds}ms segments={segments.Count} matches={detections.Count} tilt={ocr.LastTextAngle:0.##}");
                 log.WriteLine(info);
@@ -468,6 +474,130 @@ internal static class SelfTest
     }
 
     /// <summary>Exercise the window/hook plumbing without putting anything visible on screen.</summary>
+    /// <summary>Runs async UI work (WebView2) on an STA thread with a message loop, like the real app.</summary>
+    static int OnUiThread(Func<Task<int>> work)
+    {
+        var result = 1;
+        var thread = new Thread(() =>
+        {
+            using var host = new Form { ShowInTaskbar = false, StartPosition = FormStartPosition.Manual, Location = new Point(-32000, -32000) };
+            host.Load += async (_, _) =>
+            {
+                try { result = await work(); }
+                catch (Exception ex) { Log.Write("selftest: " + ex); }
+                finally { host.Close(); }
+            };
+            Application.Run(host);
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        return result;
+    }
+
+    /// <summary>The trade API through the hidden WebView2 page: leagues, filters, static data, stats.</summary>
+    static async Task<int> TradeProbe(string outDir, StreamWriter log)
+    {
+        using var api = new TradeApi();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await api.EnsureReadyAsync();
+            log.WriteLine($"page ready in {sw.ElapsedMilliseconds} ms");
+            foreach (var name in new[] { "leagues", "filters", "static", "stats", "items" })
+            {
+                var r = await api.GetAsync("data", "/api/trade2/data/" + name);
+                File.WriteAllText(Path.Combine(outDir, name + ".json"), r.Body);
+                log.WriteLine($"{name}: HTTP {r.Status}, {r.Body.Length} chars, limits: " +
+                              string.Join(" ", r.Headers.Select(h => $"{h.Key}={h.Value}")));
+            }
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            log.WriteLine("FAILED: " + ex.Message);
+            Log.Write("trade probe: " + ex);
+            return 1;
+        }
+    }
+
+    /// <summary>Real trade price checks of copied item texts (files), optionally with a poe.ninja build link.</summary>
+    static async Task<int> TradeCheck(StreamWriter log, List<string> args)
+    {
+        var settings = AppSettings.Load();
+        var league = string.IsNullOrEmpty(settings.League) ? "Forbidden Rites" : settings.League;
+        var link = args.FirstOrDefault(BuildProfile.IsLink);
+        var files = args.Where(a => !BuildProfile.IsLink(a)).ToList();
+        BuildProfile? build = null;
+        if (link != null)
+        {
+            build = await BuildProfile.LoadAsync(link);
+            log.WriteLine($"build {build.Character}: {build.Summary}, {build.GearStats.Count} gear stats");
+        }
+        var db = PriceCache.Load(league);
+        var matcher = db == null ? null : new ItemMatcher(db);
+        double? DivineOf(string name) => matcher?.Lookup(name)?.FirstOrDefault()?.Divine;
+
+        using var trade = new TradeChecker();
+        var failed = 0;
+        foreach (var file in files)
+        {
+            var item = TradeItem.Parse(File.ReadAllText(file));
+            log.WriteLine($"== {Path.GetFileName(file)}: {item?.Rarity} {item?.Name} / {item?.BaseType} [{item?.ItemClass} -> {item?.Category}]");
+            if (item == null) { failed++; continue; }
+            foreach (var m in item.Mods) log.WriteLine($"   mod [{m.Group}] {m.Key} = {string.Join(",", m.Values)}");
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                var r = await trade.PriceCheckAsync(item, league, build, settings, DivineOf);
+                log.WriteLine($"   {r.Total} listed, {sw.ElapsedMilliseconds} ms, {r.Url}");
+                log.WriteLine("   filters: " + string.Join(" | ", r.Filters) + (r.Dropped.Count > 0 ? "   dropped: " + string.Join(" | ", r.Dropped) : ""));
+                log.WriteLine("   prices: " + string.Join(", ", r.Prices.Select(p => p.Divine is { } d ? Fmt.Number(d) + " div" : p.Raw)));
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                log.WriteLine("   FAILED: " + ex.Message);
+            }
+        }
+        return failed == 0 ? 0 : 1;
+    }
+
+    /// <summary>Grades copied item texts (files) the way the price check does, offline.</summary>
+    static int GradeItems(StreamWriter log, List<string> files)
+    {
+        foreach (var file in files)
+        {
+            var item = TradeItem.Parse(File.ReadAllText(file));
+            if (item == null) { log.WriteLine($"== {Path.GetFileName(file)}: not an item"); continue; }
+            log.WriteLine($"== {Path.GetFileName(file)}: {item.Rarity} {item.Name} / {item.BaseType} [{item.Category}]");
+            foreach (var m in item.Mods)
+                log.WriteLine($"   [{m.Group}{(m.Affix != null ? " " + m.Affix : "")}{(m.Tier is { } t ? " T" + t : "")}] {m.Line}  -> {ItemGrader.KindOf(m.Key)} w{ItemGrader.Weight(m.Key)}");
+            if (!ItemGrader.Applies(item)) { log.WriteLine("   (not graded)"); continue; }
+            var g = ItemGrader.Grade(item);
+            log.WriteLine(g.Garbage ? "   GARBAGE" : $"   GRADE {g.Grade} ({g.Score:0.0}) type {g.Type}");
+            foreach (var v in g.Valuable) log.WriteLine($"     + {v.Mod.Line} ({v.Kind}, {v.Score:0.0})");
+            foreach (var m in g.Ignored) log.WriteLine($"     - ignored {m.Line}");
+        }
+        return 0;
+    }
+
+    /// <summary>Better Trading into the WebView2 profile (downloads it the first time), then the installed list.</summary>
+    static async Task<int> TradeExtension(StreamWriter log)
+    {
+        using var host = new Form { ShowInTaskbar = false, StartPosition = FormStartPosition.Manual, Location = new Point(-32000, -32000) };
+        using var view = new Microsoft.Web.WebView2.WinForms.WebView2 { Dock = DockStyle.Fill };
+        host.Controls.Add(view);
+        host.Show();
+        var env = await TradeWeb.EnvironmentAsync();
+        await view.EnsureCoreWebView2Async(env);
+        var status = await TradeWeb.SetBetterTradingAsync(view.CoreWebView2.Profile, true, env.BrowserVersionString);
+        log.WriteLine("status: " + status);
+        foreach (var e in await view.CoreWebView2.Profile.GetBrowserExtensionsAsync())
+            log.WriteLine($"extension: {e.Name} ({e.Id}) enabled={e.IsEnabled}");
+        return 0;
+    }
+
     static int Smoke(string outDir, StreamWriter log)
     {
         var ok = true;
@@ -499,6 +629,30 @@ internal static class SelfTest
                 form.Close();
                 bmp.Save(Path.Combine(outDir, "settings.png"));
                 log.WriteLine($"settings form: {form.Size}");
+
+                using (var browser = new TradeBrowserForm(new AppSettings()))
+                {
+                    browser.Location = new Point(-10000, -10000);
+                    browser.Show();
+                    Application.DoEvents();
+                    using var shot = new Bitmap(browser.Width, browser.Height);
+                    browser.DrawToBitmap(shot, new Rectangle(Point.Empty, browser.Size));
+                    shot.Save(Path.Combine(outDir, "trade-browser.png"));
+                    log.WriteLine($"trade browser form: {browser.Size}");
+                }
+
+                // The trade price label, as it looks with a result.
+                var demo = new TradeResult { Total = 750, Url = "https://www.pathofexile.com/trade2/search/poe2/Standard/x" };
+                foreach (var d in new[] { 3.0, 3, 3.2, 4, 5, 5, 5.5 }) demo.Prices.Add((d, $"{d} divine"));
+                demo.Filters.AddRange(new[] { "any gloves base", "ES \u2265 223", "\u226513% increased Rarity of Items found", "ele res \u2265 28%" });
+                var label = LabelBuilder.ForTrade(new Point(40, 40), "Oblivion Vise", null, null, new AppSettings(), demo, null);
+                using (var canvas = new Bitmap(520, 300))
+                using (var g = Graphics.FromImage(canvas))
+                {
+                    g.Clear(Color.FromArgb(40, 60, 70));
+                    OverlayRenderer.Draw(g, Point.Empty, canvas.Size, new[] { label });
+                    canvas.Save(Path.Combine(outDir, "trade-label.png"));
+                }
 
                 var settings = AppSettings.Load();
                 if (PriceCache.Load(string.IsNullOrEmpty(settings.League) ? "Standard" : settings.League) is { } db)

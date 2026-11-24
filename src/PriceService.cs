@@ -48,6 +48,7 @@ public sealed class PriceService
     };
 
     const string BaseUrl = "https://poe.ninja/poe2/api/economy/";
+    public const string UserAgent = "poe2verlay/1.0 (personal PoE2 price overlay)";
 
     readonly HttpClient _http;
 
@@ -57,7 +58,7 @@ public sealed class PriceService
         {
             Timeout = TimeSpan.FromSeconds(30),
         };
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd("poe2verlay/1.0 (personal PoE2 price overlay)");
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd(UserAgent);
     }
 
     public async Task<List<string>> GetLeaguesAsync()

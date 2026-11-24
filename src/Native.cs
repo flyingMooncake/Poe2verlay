@@ -83,6 +83,31 @@ internal static class Native
     [DllImport("user32.dll")] public static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint affinity);
     [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] public static extern int SetWindowTheme(IntPtr hWnd, string? appName, string? idList);
     [DllImport("user32.dll")] public static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+
+    /// <summary>
+    /// Takes the keyboard from the window in front (the game). Windows refuses SetForegroundWindow to a program that
+    /// didn't get the last input, unless its thread shares input with the foreground one for the moment.
+    /// </summary>
+    public static void ForceForeground(IntPtr hwnd)
+    {
+        var front = GetForegroundWindow();
+        var frontThread = front == IntPtr.Zero ? 0 : GetWindowThreadProcessId(front, out _);
+        var me = GetCurrentThreadId();
+        var attached = frontThread != 0 && frontThread != me && AttachThreadInput(me, frontThread, true);
+        try
+        {
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+        }
+        finally
+        {
+            if (attached) AttachThreadInput(me, frontThread, false);
+        }
+    }
     [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll", SetLastError = true)]

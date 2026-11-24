@@ -123,12 +123,14 @@ internal static class Fmt
 
 internal static class LabelBuilder
 {
-    public static List<OverlayBar> BarsForDetections(IReadOnlyList<Detection> detections, PriceDb db, AppSettings s)
+    public static List<OverlayBar> BarsForDetections(IReadOnlyList<Detection> detections, PriceDb db, AppSettings s,
+        IReadOnlyList<TextSegment>? unpriced = null)
     {
+        unpriced ??= Array.Empty<TextSegment>();
         var max = detections.Count == 0 ? 0 : detections.Max(d => d.TotalDivine);
         var distinct = detections.Select(d => d.Entry).Distinct().Count();
-        // Nothing worth taking: say so instead of starring the least bad.
-        var roll = detections.Count > 0 && max * db.ChaosPerDivine < s.RollBelowChaos;
+        // Nothing worth taking: say so instead of starring the least bad. Not when some choices have no price.
+        var roll = detections.Count > 0 && unpriced.Count == 0 && max * db.ChaosPerDivine < s.RollBelowChaos;
         var bars = new List<OverlayBar>();
         foreach (var d in detections)
         {
@@ -146,6 +148,16 @@ internal static class LabelBuilder
                 TagColor = tagColor,
             });
         }
+        foreach (var row in unpriced)
+            bars.Add(new OverlayBar
+            {
+                Anchor = row.Bounds,
+                TextHeight = row.Bounds.Height,
+                Text = "no price",
+                Fill = Palette.Dim,
+                Tag = "not on poe.ninja",
+                TagColor = Palette.Dim,
+            });
         if (roll)
         {
             // One row above the first choice, in the same column as the bars.
@@ -178,6 +190,135 @@ internal static class LabelBuilder
         AddPriceLines(label, entry, variants, quantity, db, s, unitFirst: true);
         return label;
     }
+
+    /// <summary>
+    /// Price check on the trade site: lowest to highest of the cheapest listings, the listings themselves, how many
+    /// match, and the filters used. <paramref name="trade"/> and <paramref name="error"/> null = still searching.
+    /// </summary>
+    public static OverlayLabel ForTrade(Point cursor, string title, PriceEntry? ninja, PriceDb? db, AppSettings s,
+        TradeResult? trade, string? error, ItemGrade? grade = null)
+    {
+        var label = new OverlayLabel
+        {
+            Anchor = new RectangleF(cursor.X + 12, cursor.Y - 12, 8, 24),
+            HighlightAnchor = false,
+            Accent = Palette.Border,
+        };
+        label.Lines.Add(new LabelLine { Text = title, Color = Palette.Text, Bold = true, Size = 0.9f });
+        if (grade != null) AddGradeLines(label, grade);
+        if (ninja != null && db != null)
+            label.Lines.Add(new LabelLine { Text = "poe.ninja: " + Fmt.Price(ninja.Divine, db, s), Color = Palette.Dim, Size = 0.82f,
+                Tag = ninja.IsUnique ? "  (listings)" : null, TagColor = Palette.Dim });
+
+        if (error != null)
+        {
+            label.Lines.Add(new LabelLine { Text = "trade: " + error, Color = Palette.Warn, Size = 0.85f });
+            label.Accent = Palette.Warn;
+            return label;
+        }
+        if (trade == null)
+        {
+            label.Lines.Add(new LabelLine { Text = "searching the trade site…", Color = Palette.Dim, Size = 0.85f });
+            return label;
+        }
+
+        var known = trade.Prices.Where(p => p.Divine != null).Select(p => p.Divine!.Value).ToList();
+        if (trade.Total == 0)
+        {
+            label.Lines.Add(new LabelLine { Text = "trade: nothing listed like this", Color = Palette.Warn, Bold = true });
+        }
+        else if (known.Count > 0)
+        {
+            // Cheap things read better in exalted orbs.
+            var inEx = db is { ExaltedPerDivine: > 0 } && known.Max() < 0.5;
+            string One(double d) => inEx ? Fmt.Number(d * db!.ExaltedPerDivine) : Fmt.Number(d);
+            var unit = inEx ? " ex" : " div";
+            label.Lines.Add(new LabelLine { Text = $"trade: {One(known.Min())} → {One(known.Max())}{unit}", Color = Palette.Gold, Bold = true });
+            label.Lines.Add(new LabelLine { Text = string.Join(" · ", trade.Prices.Select(p => p.Divine is { } d ? One(d) : p.Raw)) + unit,
+                Color = Palette.Text, Size = 0.78f });
+            label.Accent = ValueColor(known.Min());
+        }
+
+        AddVerdict(label, trade, db, s);
+        var count = trade.Total > trade.Prices.Count ? $"{trade.Total} listed, the {trade.Prices.Count} cheapest above" : $"{trade.Total} listed";
+        label.Lines.Add(new LabelLine { Text = count, Color = Palette.Dim, Size = 0.78f });
+        foreach (var f in trade.Filters.Take(7)) label.Lines.Add(new LabelLine { Text = "• " + f, Color = Palette.Dim, Size = 0.75f });
+        if (trade.Dropped.Count > 0)
+            label.Lines.Add(new LabelLine { Text = "too few matches, searched without: " + string.Join(", ", trade.Dropped), Color = Palette.Warn, Size = 0.75f });
+        if (!string.IsNullOrEmpty(s.TradeBrowserHotkey))
+            label.Lines.Add(new LabelLine { Text = $"{s.TradeBrowserHotkey}: open this search in the trade browser", Color = Palette.Dim, Size = 0.75f });
+        return label;
+    }
+
+    /// <summary>A graded magic / rare item that isn't searched: garbage, or under the grade that gets a trade search.</summary>
+    public static OverlayLabel ForGrade(Point cursor, string title, ItemGrade grade, string category, AppSettings s)
+    {
+        var label = new OverlayLabel
+        {
+            Anchor = new RectangleF(cursor.X + 12, cursor.Y - 12, 8, 24),
+            HighlightAnchor = false,
+            Accent = grade.Garbage ? Palette.Bad : Palette.Border,
+        };
+        label.Lines.Add(new LabelLine { Text = title, Color = Palette.Text, Bold = true, Size = 0.9f });
+        if (grade.Garbage)
+        {
+            var kind = category.Length > 0 ? category.Split('.').Last() : "item";
+            label.Lines.Add(new LabelLine { Text = "GARBAGE  \u2192  VENDOR", Color = Palette.Bad, Bold = true });
+            label.Lines.Add(new LabelLine { Text = $"nothing on it that buyers pay for on a {kind}", Color = Palette.Dim, Size = 0.8f });
+            AddIgnored(label, grade);
+            return label;
+        }
+        AddGradeLines(label, grade);
+        label.Lines.Add(new LabelLine { Text = $"not searched: under grade {s.TradeSearchFromGrade}", Color = Palette.Dim, Size = 0.75f });
+        return label;
+    }
+
+    /// <summary>
+    /// SELL or VENDOR: the median of the cheapest listings like it against the threshold in chaos. The cheapest one
+    /// alone is often a mistake or a bait listing, the median of the cheapest ten is what it sells for.
+    /// </summary>
+    static void AddVerdict(OverlayLabel label, TradeResult trade, PriceDb? db, AppSettings s)
+    {
+        if (db is not { ChaosPerDivine: > 0 }) return;
+        var known = trade.Prices.Where(p => p.Divine != null).Select(p => p.Divine!.Value).OrderBy(v => v).ToList();
+        if (trade.Total == 0 || known.Count == 0)
+        {
+            label.Lines.Add(new LabelLine { Text = "VENDOR  \u00b7  nothing like it listed", Color = Palette.Bad, Bold = true, Size = 0.9f });
+            return;
+        }
+        var chaos = known[known.Count / 2] * db.ChaosPerDivine;
+        var sell = chaos >= s.SellAboveChaos;
+        label.Lines.Add(new LabelLine
+        {
+            Text = sell ? $"SELL  \u00b7  ~{Fmt.Number(chaos)} c" : $"VENDOR  \u00b7  ~{Fmt.Number(chaos)} c, under {Fmt.Number(s.SellAboveChaos)} c",
+            Color = sell ? Palette.Best : Palette.Bad,
+            Bold = true,
+            Size = 0.9f,
+        });
+        if (!sell) label.Accent = Palette.Bad;
+    }
+
+    /// <summary>"GRADE A · minion", then the mods that make it (T1 = best roll), then the ones that don't count.</summary>
+    static void AddGradeLines(OverlayLabel label, ItemGrade grade)
+    {
+        var color = grade.Grade switch { "S" => Palette.Best, "A" => Palette.Gold, "B" => Palette.Text, _ => Palette.Dim };
+        label.Lines.Add(new LabelLine { Text = $"GRADE {grade.Grade}  \u00b7  {grade.Type}", Color = color, Bold = true,
+            Tag = grade.Missing != null ? $"  ({grade.Missing})" : null, TagColor = Palette.Warn });
+        foreach (var v in grade.Valuable.OrderByDescending(v => v.Score).Take(6))
+        {
+            var tier = v.Mod.Tier is { } t ? $"T{t}" : "  \u2022";
+            label.Lines.Add(new LabelLine { Text = $"{tier}  {Short(v.Mod.Line)}", Color = Palette.Text, Size = 0.78f });
+        }
+        AddIgnored(label, grade);
+    }
+
+    static void AddIgnored(OverlayLabel label, ItemGrade grade)
+    {
+        foreach (var m in grade.Ignored.Take(2))
+            label.Lines.Add(new LabelLine { Text = $"ignored: {Short(m.Line)}", Color = Palette.Dim, Size = 0.72f });
+    }
+
+    static string Short(string text) => text.Length > 52 ? text[..51] + "\u2026" : text;
 
     public static OverlayLabel Message(RectangleF anchor, string title, string? detail)
     {

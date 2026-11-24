@@ -12,7 +12,7 @@
     <RootNamespace>Poe2Verlay</RootNamespace>
     <ApplicationIcon>assets/poe2verlay.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Version>1.0.1</Version>
+    <Version>1.1.0</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <Product>poe2verlay</Product>
 
@@ -24,5 +24,22 @@
     <DebugType>none</DebugType>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Trade browser and trade price checks: the Edge WebView2 runtime that ships with Windows 10/11. -->
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4191.47" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Best roll of every mod per item type (tools/gen_mod_max.py, from Path of Building data): grades rare items. -->
+    <EmbeddedResource Include="assets/mod-max.json" LogicalName="mod-max.json" />
+  </ItemGroup>
+
+  <!-- The package also references its WPF control, which a WinForms app can't use (and which only adds a warning). -->
+  <Target Name="DropWebView2Wpf" BeforeTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <Reference Remove="@(Reference)" Condition="'%(Filename)' == 'Microsoft.Web.WebView2.Wpf'" />
+    </ItemGroup>
+  </Target>
 
 </Project>

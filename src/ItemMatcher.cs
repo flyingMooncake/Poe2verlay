@@ -157,8 +157,12 @@ public sealed partial class ItemMatcher
     /// matches beside that column count; the rest (chat lines, item labels on the ground) are not choices and must
     /// not take the best-pick star.
     /// </summary>
-    public static List<Detection> PanelRows(List<Detection> detections)
+    public static List<Detection> PanelRows(List<Detection> detections, IReadOnlyList<TextSegment> segments)
     {
+        // With the panel's title on screen only its right-aligned rows count: never a quest line that names a
+        // fragment, nor chat drawn over the panel.
+        if (PanelColumn(segments) is { } p)
+            return detections.Where(d => p.Panel.Contains(Center(d.Bounds)) && Math.Abs(d.Bounds.Right - p.Right) <= p.Tolerance).ToList();
         if (detections.Count < 3) return detections;
         var heights = detections.Select(d => d.TextHeight).OrderBy(h => h).ToList();
         var lineHeight = heights[heights.Count / 2];
@@ -178,6 +182,46 @@ public sealed partial class ItemMatcher
         return detections.Where(d => d.Bounds.Right > left && d.Bounds.Left < right + lineHeight * 2 &&
                                      d.Bounds.Top > top && d.Bounds.Bottom < bottom).ToList();
     }
+
+    /// <summary>
+    /// The remnant reward panel ("Runeshape Combinations"). OCR garbles its title ("Rnshope Combinati0Y6") but always
+    /// reads it; the choices sit in a column below. Null when the title is not on screen.
+    /// </summary>
+    public static RectangleF? RewardPanel(IReadOnlyList<TextSegment> segments)
+    {
+        var title = segments.FirstOrDefault(sg => PanelTitle().IsMatch(sg.Text));
+        if (title == null) return null;
+        // Measured at 1080p: a 23 px high title at (206,121), rows from x 50 to 545 and down to y ~700.
+        var h = title.Bounds.Height;
+        return RectangleF.FromLTRB(title.Bounds.Left - 9 * h, title.Bounds.Bottom, title.Bounds.Right + 9 * h, title.Bounds.Bottom + 27 * h);
+    }
+
+    [GeneratedRegex(@"comb[il1|]nat|runesh", RegexOptions.IgnoreCase)]
+    private static partial Regex PanelTitle();
+
+    /// <summary>
+    /// Panel rows without a price (skill rewards like "Skill: Skyfall" are not on poe.ninja): the lines in the panel's
+    /// right-aligned column that no detection covers. They still get a bar, so the panel doesn't look unread.
+    /// </summary>
+    public static List<TextSegment> UnpricedRows(IReadOnlyList<TextSegment> segments, IReadOnlyList<Detection> detections)
+    {
+        if (PanelColumn(segments) is not { } p) return new();
+        return p.Lines.Where(sg => Math.Abs(sg.Bounds.Right - p.Right) <= p.Tolerance &&
+                                   !detections.Any(d => d.Bounds.IntersectsWith(sg.Bounds))).ToList();
+    }
+
+    /// <summary>The reward panel, its text lines and the right edge most of them share (the choices are right-aligned).</summary>
+    static (RectangleF Panel, List<TextSegment> Lines, float Right, float Tolerance)? PanelColumn(IReadOnlyList<TextSegment> segments)
+    {
+        if (RewardPanel(segments) is not { } panel) return null;
+        var lines = segments.Where(sg => panel.Contains(Center(sg.Bounds)) && sg.Text.Count(char.IsLetter) >= 4).ToList();
+        if (lines.Count == 0) return null;
+        var tolerance = Math.Max(10f, lines.Select(sg => sg.Bounds.Height).OrderBy(v => v).ElementAt(lines.Count / 2) * 0.6f);
+        var right = lines.Select(sg => sg.Bounds.Right).OrderByDescending(r => lines.Count(o => Math.Abs(o.Bounds.Right - r) <= tolerance)).First();
+        return (panel, lines, right, tolerance);
+    }
+
+    static PointF Center(RectangleF r) => new(r.X + r.Width / 2, r.Y + r.Height / 2);
 
     public List<Detection> Find(IReadOnlyList<TextSegment> segments)
     {
